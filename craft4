@@ -1,0 +1,1426 @@
+--NOTE TO SELF
+
+--[[
+	* Build user interface (with help menus)
+	* Build monitor support
+	* Build storage support
+	* Build processing support
+	* Build network container
+	* Build vanilla minecraft recipe library
+	* adapt to user using user metadata
+	* support for items with more than 1 recipe (different planks can all make the same stick)
+]]
+	
+
+-- 											USER SETTINGS
+local settings = {}
+settings.address = 'settings'
+settings.token = 'Apple'
+settings.infiniTool = 99999 -- number of uses for infinite tools
+settings.loadVanillaRecipes = false;
+
+local forceRaw = false
+
+-- 									IMPORTANT PERIPHERALS AND VARIABLES
+
+local recipes = {}
+local recipeFilePath = 'StorageContents/craft/recipes'
+
+--											DATA STRUCTS
+
+-- string indexing
+local stringDex = {
+	new = function(self,stringData)
+		local o = {data = stringData}
+		return setmetatable(o, {__index = function(t,k) return string.sub(t.data,k,k) end})
+	end
+}
+
+
+--
+
+local Queue = {}
+
+function Queue.iterForward(a,i)
+	i = i + 1
+	local v = a[i]
+	if v then
+		return i, v
+	end
+end
+
+function Queue.iterBackward(a,i)
+	i = i - 1
+	local v = a[i]
+	if v then
+		return i, v
+	end
+end
+
+function Queue:new ()
+  self = setmetatable({first = 0, last = -1},{
+  __index = Queue;
+  __call = function(self, isReverse)
+	if not isReverse then
+		return self.iterForward, self, self.first-1;
+	else
+		return self.iterBackward, self, self.last+1;
+	end
+  end;
+  })
+  return self;
+end
+
+function Queue.push (queue, value)
+  local last = queue.last + 1
+  queue.last = last
+  queue[last] = value
+end
+
+function Queue.pop (queue)
+  local first = queue.first
+  if first > queue.last then return nil end
+  local value = queue[first]
+  queue[first] = nil        -- to allow garbage collection
+  queue.first = first + 1
+  return value
+end
+
+function Queue.size (queue)
+	return queue.last+1-queue.first
+end
+
+function Queue.peak(queue)
+	local first = queue.first
+	return queue[first]
+end
+
+--
+local chestProto = {className = 'chestproto'}
+chestProto.containers = {}
+-- static final vars
+chestProto.chestInfo = {
+		['chest']={rowSize=9};
+		['copper']={rowSize=9};
+		['gold']={rowSize=9};
+		['silver']={rowSize=9};
+		['iron']={rowSize=9};
+		['diamond']={rowSize=12};
+		['crystal']={rowSize=12};
+		['obsidian']={rowSize=12};
+		['draconic_chest']={rowSize=26};
+		['peripheral'] = {};
+		['ender']=nil; -- has no open peripheral compatability
+		}
+			
+-- uses the chestInfo table to determine if a container can be a new instance of ChestProto
+function chestProto:isValidContainer(side)
+	side = side or 'front'
+	local name = peripheral.getType
+	if name(side) then
+		local data = self.chestInfo[name(side):lower()]
+		if data then
+			data.name = name;
+			return data
+		else
+			return false
+		end
+	else
+		return false
+	end
+end
+
+function chestProto:report()
+	local border = '-';
+	border = border:rep(20);
+	print('\n\t'..border..
+		  '\n\t container: '..self.name..
+		  '\n\t rowSize: '..self.rowSize..
+		  '\n\t Facing: '..self.facing..
+		  '\n\t Peripheral: set'..
+		  '\n\t Size: '..self.size..
+		  '\n\t Direction: '..self.direction..
+		  '\n\t'..border)
+end
+
+-- index metamethod
+function chestProto.__index(t,k)
+	if type(k) == 'number' then
+		-- always receive a value
+		local stack = t.peripheral.getStackInSlot(k)
+		if stack then
+			stack.display_name = stack.display_name:gsub('%s','_') or nil -- make all spaces undercore
+			return stack
+		else
+			return {display_name  = 'empty', qty = 0}
+		end
+	else
+		return t.class[k]
+	end
+end
+
+function chestProto.mutable(func)
+  local currentfunc = func
+  
+  local function mutate( newfunc)
+    local lastfunc = currentfunc
+    currentfunc = function(...)
+		local newResult = newfunc(...)
+		return newResult~=nil and newResult or lastfunc(...)
+	end
+  end
+  local wrapper = function(...) return currentfunc(...) end
+  return wrapper, mutate
+end
+
+
+-- inherit method
+function chestProto:defineSub(className)
+	chestProto.containers[className] = {}
+	local subClass = {super = self, className = className, mods = {}}
+	local classWrapper, mutator = chestProto.mutable(function(t,k) return self[k] end)
+
+	-- takes a table
+	function subClass:addModule(mod)
+		table.insert(subClass.mods,mod)
+		mutator(function(...) return mod[arg[2]] end)
+	end
+	
+	-- constructor
+	function subClass:new(rowSize,name)
+		local newinst = {rowSize=rowSize, name=name, class = subClass}
+		table.insert(chestProto.containers[className], newinst)
+		return setmetatable(newinst,{__index = function(t,k) return chestProto.__index(t,k) end});
+	end
+
+	return setmetatable(subClass, {__index=function (t,k) return classWrapper(t,k) end});
+end
+
+-- initialization function call 
+-- requires atleast 1 attached turtle peripheral 
+-- requires container have atleast 1 empty slot 
+-- if no facing is supplied returns the peripheral component of object 
+function chestProto:init(facing)
+		if facing then
+				self.facing = facing;
+				self.peripheral = peripheral.wrap(facing);
+				self.size = self.peripheral.getInventorySize();
+				self.name = peripheral.getType(facing):lower();
+				
+				-- turn a turtle peripheral into an item that can be used to determine
+				-- the real world direction of the container
+				
+				-- attempting to unequip a peripheral
+				local side = 'right'
+				turtle.select(1)
+				parallel.waitForAll(function() shell.run('unequip right') end)
+				if turtle.getItemCount(1)==0 then
+					parallel.waitForAll(function() shell.run('unequip left') end)
+					if turtle.getItemCount(1)==0 then
+						error('No crafting peripheral found on turtle.')
+					else
+						side = 'left'
+					end
+				end
+				
+				-- get empty container slot
+				local testSlot = nil
+				for k=1, self.size do if not self.peripheral.getStackInSlot(k) then testSlot = k break end end;
+				if not testSlot then error('Container is full.') end
+				
+				-- trial/error find direction of container relative to turtle
+				for _,direction in pairs({'north', 'east', 'south', 'west', 'up', 'down'}) do
+					do
+					pcall(function () self.peripheral.pullItemIntoSlot(direction,1,1,testSlot) end)
+						if turtle.getItemCount(1) == 0 then
+							self.direction = direction;  -- used by the push and pull functions
+							self.peripheral.pushItemIntoSlot(direction, testSlot,1,1)
+							break
+						end
+					end
+				end
+					
+				-- re-equip peripheral
+				if side == 'right' then
+					turtle.equipRight(1);
+				else
+					turtle.equipLeft(1);
+				end
+
+				-- initialize mods
+				for _,mod in pairs(self.class.mods) do mod.modInit(self) end
+
+				self:report()
+				sleep(1)
+		else
+				return self.peripheral
+		end
+end
+
+-- chest.pullItemIntoSlot()
+-- pulls from turtle
+function chestProto:pull(turtleSlot,containerSlot,optionalAmount)
+	self.peripheral.pullItemIntoSlot(self.direction,turtleSlot, optionalAmount or 64, containerSlot);
+end
+
+-- chest.pushItemIntoSlot()
+-- pushs to turtle
+function chestProto:push(containerSlot,turtleSlot,optionalAmount)
+	self.peripheral.pushItemIntoSlot(self.direction, containerSlot, optionalAmount or 64, turtleSlot);
+end
+
+function chestProto:swap(from, to)
+	self.peripheral.swapStacks(from,to);
+end
+
+function chestProto:condense()
+	self.peripheral.condenseItems();
+end
+
+function chestProto:findEmptySlot(optionalStack)
+	-- standard container without interface slots
+	if optionalStack then
+		for k=1, self.size do
+			local stack = self[k]
+			if (stack.qty==0 or (stack.display_name == optionalStack.display_name and
+				(stack.qty+optionalStack.qty) <= optionalStack.max_size)) then
+				return k
+			end
+		end
+	else
+		for k=1, self.size do
+			local stack = self[k]
+			if stack.qty == 0 then
+				return k
+			end
+		end
+	end
+	return false -- no empty slots
+end
+
+-- returns slot and quantity of the item
+-- -1 if nothing found matches
+function chestProto:searchForItem(display_name)
+	for slot=1, self.size do
+		local stack = self[slot]
+		if stack.qty>0 and stack.display_name == display_name then
+			return slot, stack.qty
+		end
+	end
+	return false
+end
+
+-- transfers an item from a container to another through the turtle inventory
+-- returns false if the item could not be transferred.
+function chestProto:shunt(itemSlot, container, amount)
+	empty = container:findEmptySlot(self[itemSlot])
+	if empty then
+		self:push(itemSlot, 16, amount)
+		container:pull(16, empty, amount)
+	else
+		return false
+	end
+end
+
+function chestProto:flushTurtleInventory()
+	for tslot=1, 16 do
+		if turtle.getItemCount(tslot)>0 then
+			local emptySlot = nil
+			for k=1, self.size do
+				if self[k].qty==0 then emptySlot = k break end;
+			end
+			if emptySlot then
+				self:pull(tslot,emptySlot);
+			else 
+				return false 
+			end
+		end
+	end
+	return true
+end
+
+-- dummy function 
+function chestProto:update()
+	return true
+end
+
+-- 										CONTAINER MODULES
+
+--		VIRTUAL INVENTORY MODULE
+vInventory = {
+	modName = 'virtual_inventory';
+
+	-- called during the container's init
+	modInit = function(self)
+		self:condense()
+		self.virtualInventory = {}
+		self.virtualInventory.items = {}
+		self.virtualInventory.unique = 0
+	end;
+
+	storeItem = function(self, stack,slot)
+		stack.display_name = stack.display_name:lower()
+		local virtualData = self.virtualInventory.items[stack.display_name]
+		if virtualData then
+			self.virtualInventory.items[stack.display_name].qty = (stack.display_name ~= 'empty') and virtualData.qty + stack.qty or virtualData.qty + 1
+			table.insert(self.virtualInventory.items[stack.display_name].slots,slot)
+		else
+			self.virtualInventory.items[stack.display_name] = { qty = stack.qty, slots = {slot} }
+			self.virtualInventory.unique = self.virtualInventory.unique+1
+		end
+	end;
+
+	scan = function(self)
+		self:modInit()
+		for slot=1, self.size do
+			local stack = self[slot]
+			self:storeItem(stack,slot)
+		end
+		if self.virtualInventory.items['empty'] then self.virtualInventory.unique = self.virtualInventory.unique - 1 end
+	end;
+
+	-- returns the slots that the items are held in
+	-- function assumes that the qty is less than or equal to the number of items available in the virtual inventory
+	withdraw = function(self, display_name, qty)
+		display_name = display_name:lower()
+		local data = self.virtualInventory.items[display_name]
+		if data and display_name ~= 'empty' then
+			self.virtualInventory.items[display_name].qty = qty<=data.qty and data.qty - qty or 0
+			-- deduct slots
+			local withdrawSlots = {}
+			-- lowest to high presort
+			table.sort(data.slots, function (a,b) 
+				local aSize = self.peripheral.getStackInSlot(a).qty
+				local bSize = self.peripheral.getStackInSlot(b).qty
+				return aSize < bSize
+			end) 
+			for slotIndex,slot in ipairs(data.slots) do
+				local sCount = self.peripheral.getStackInSlot(slot).qty
+				if sCount <= qty then
+					table.insert(withdrawSlots,slot)
+					table.remove(self.virtualInventory.items[display_name].slots,slotIndex)
+					qty = qty - sCount
+				else
+					-- sorted list
+					break;
+				end
+			end
+			if qty>0 then
+				 _,slot = next(data.slots)
+				table.insert(withdrawSlots,slot)
+			end
+			return withdrawSlots
+		end
+	end;
+
+	freeSpace64 = function(self)
+		local empty = self.virtualInventory.items['empty'] 
+		if empty then
+			-- standard stack count
+			return empty.qty*64
+		else
+			return 0;
+		end
+	end;
+
+	usedSlots = function(self)
+		local empty = self.virtualInventory.items['empty']
+		if empty then
+			return self.size - empty.qty
+		else
+			return self.size
+		end
+	end;
+
+	reportInventory = function(self)
+		if not self.virtualInventory then
+			print('Container '..self..' of type '..self.className..' requires a scan.');
+		else
+			print('Number of unique items: '..self.virtualInventory.unique)
+			print('Items -- '..self:usedSlots()..'/'..self.size)
+			print('')
+			for itemName,data in pairs(self.virtualInventory.items) do
+				local slotString = ''
+				for k,slot in ipairs(data.slots) do slotString = slotString..slot..',' end
+				print(itemName..'\t qty: '..data.qty..' slots: '..slotString)
+				io.read()
+			end
+		end
+	end;
+
+	searchForItem = function(self, partialString, refinedSearch)
+		local results = {}
+
+		if #partialString>0 then
+			partialString = partialString:gsub('%s','_'):lower()
+			partialString = stringDex:new(partialString)
+
+			if not refinedSearch then refinedSearch = self.virtualInventory.items end
+
+			-- naive
+			--[[
+			local partialLength = #partialString.data
+			for word,data in pairs(refinedSearch) do
+				word = stringDex:new(word)
+				local wordLength = #word.data
+				local found = false
+				for charDex=1, wordLength-partialLength+1 do
+					if not found then
+						for patternDex=1, partialLength do
+							local patternChar = partialString[patternDex]
+							if not (patternChar == word[charDex+patternDex-1]) then
+								break
+							end
+							if patternDex == partialLength then found = true; results[word.data] = data break; end
+						end
+					else break end;
+				end
+			end
+			]]
+			-- Boyer-Moore
+			-- preprocess
+			local partialLength = #partialString.data
+			local preprocess = {}
+			for k=1, partialLength do
+				if k<partialLength then
+					preprocess[partialString[k]] = partialLength-k
+				else
+					preprocess[partialString[k]] = preprocess[partialString[k]] and preprocess[partialString[k]] or partialLength
+				end
+			end
+			preprocess = setmetatable(preprocess,{__index = function(t,k) return partialLength end})
+			-- test
+
+
+			for word,data in pairs(refinedSearch) do
+				word = stringDex:new(word)
+				local wordLength = #word.data
+				local found = false
+				local charDex = 1
+				local shiftAmount = 0
+				while (partialLength <= wordLength) and not found do
+					local shiftChar = word[partialLength + shiftAmount]
+					for patternDex=partialLength, 1,-1 do
+						local char = word[patternDex+shiftAmount]
+						if not (partialString[patternDex] == char) then
+							wordLength = wordLength - preprocess[shiftChar]
+							shiftAmount = shiftAmount + preprocess[shiftChar]
+							break
+						end
+
+						if patternDex == 1 then 
+							found = true; 
+							results[word.data] = data 
+							break; 
+						end
+					end
+				end
+			end
+
+
+		end
+		return results
+	end;
+
+	findEmptySlot = function (self,optionalStack)
+		if not optionalStack then
+			_, slot = next(self:searchForItem('empty').slots)
+			return slot
+		else
+
+		end
+	end;
+}
+
+
+--		STATE INTERFACE MODULE
+
+Interface = {
+
+-- CLASS
+newInterface = function(self)
+	-- subclass data that all instances use as a prototype
+	self.Istates = {idle={name='idle', transitions = {}}}
+	self.IEvents = {}
+end;
+
+newState = function(self, stateName)
+	assert(stateName, 'Must give a name to state.')
+	local s = {name = stateName, transitions = {}};
+
+	-- ...  = events 
+	s.newTransition = function( toState, events)
+		assert(toState.name, 'No toState for transition.')
+		assert(events, 'No events for transition.')
+		self.transitions[toState] = events
+		return s
+	end;
+
+	self.Istates[stateName] = s;
+	return s
+end;
+
+-- event func should evaluate true if the event has occured
+newEvent = function(self, eventName, func)
+	self.IEvents[eventName] = func
+end;
+
+getEvent = function (self, eventName)
+	return self.IEvents[eventName];
+end
+
+
+-- INSTANCE FUNCTIONS
+modInit = function(self)
+	self.iCurrentState = self.Istates.idle
+	self.tempUpdate = self.update
+end;
+
+getState = function(self)
+	return self.iCurrentState.name;
+end;
+
+-- overloads standard update
+update = function(self)
+	-- updates interface state
+	local eventFired = false
+	for toState, events in pairs(self.iCurrentState.transitions) do
+		for _,e in pairs(events) do
+			if e() then self.iCurrentState = toState; eventFired = true; break end
+		end
+		if eventFired then break; end
+	end
+	-- call super update
+	return self.tempUpdate()
+end;
+
+}
+
+
+--- 									CRAFTING CONTAINER
+
+-- can be called without supplying any arguments
+
+
+Craft=chestProto:defineSub('craft')
+
+-- inventory must be larger than 27
+function Craft:isValidContainer(side)
+	local side = side or 'front'
+	local data = Craft.super:isValidContainer(side)
+	if data and data.rowSize then
+		if peripheral.call(side, 'getInventorySize') > 27 then
+			return data
+		end
+	end
+	return false
+end
+
+
+function Craft:setInterface(focus, token, output, grid)
+	self.interface = {};
+	
+	self.focus = focus and focus or self:getFocusSlot(self.size)
+		self.interface[self.focus] = true;
+		
+	self.token = token and token or self:getTokenSlot(self.size) 
+		self.interface[self.token] = true; 
+		
+	self.output = output and output or self:getOutputSlot()  
+		self.interface[self.output] = true;
+		
+	self.grid = grid and grid or self:getCraftGridSlots(self.size) 
+		for k,_ in pairs(self.grid) do
+			self.interface[k] = true
+		end
+end
+
+-- bottom right corner slot
+function Craft:getFocusSlot(inventorySize)
+	return self.focus or inventorySize
+end
+
+-- 
+function Craft:getTokenSlot(inventorySize)
+	return self.token or inventorySize-self.rowSize+1
+end
+
+-- 
+function Craft:getOutputSlot()
+	return self.output or self.rowSize
+end
+
+-- container slots mapped to turtle slots for crafting
+function Craft:getCraftGridSlots(inventorySize)
+	if self.grid then return self.grid end
+	local gridSlots = {1,2,3}
+	local ceiling = math.ceil
+	for k=1, 6 do
+		local columnInc = (((k-1)%3)+1)
+		gridSlots[(ceiling(k/3)*self.rowSize)+columnInc] = (ceiling(k/3)*4) + columnInc
+	end
+	return gridSlots
+end
+
+-- finds empty slots in the container ignoring interface slots if applicable
+-- optional item name allows for restacking of the item in the container
+function Craft:findEmptySlot(optionalStack)
+	-- ignores interface slots
+	if optionalStack then
+		for k=1, self.size do
+			local stack = self[k]
+			if not(self.interface[k]) and (stack.qty==0 or (stack.display_name == optionalStack.display_name and
+				(stack.qty+optionalStack.qty) <= optionalStack.max_size)) then
+				return k
+			end
+		end
+	else
+		for k=1, self.size do
+			local stack = self[k]
+			if stack.qty == 0 and not(self.interface[k]) then
+				return k
+			end
+		end
+	end
+	print('Crafting chest too full. Please clear up some space.') error()
+end
+
+-- clears the chest crafting grid and the output and focus slots
+-- whatever slots are given as arguments are not cleared
+function Craft:clearInterface(...)
+	for interfaceSlot,_ in pairs(self.interface) do
+		local ignored = false
+		for k,v in pairs(arg) do
+			if interfaceSlot == v then ignored = true; break end
+		end
+		if not ignored then
+			local stack = self[interfaceSlot]
+			if stack.qty>0 then
+				local freeSpace = self:findEmptySlot(stack)
+				if freeSpace then
+					self:swap(interfaceSlot, freeSpace)
+				else
+					return false
+				end
+			end
+		end
+	end
+	return true
+end
+
+-- returns slot and quantity in that slot of a specified item name
+function Craft:searchForItem(display_name, excludeInterface)
+	if excludeInterface then
+		for k=1, self.size do
+			if not self.interface[k] then
+				local stack = self[k]
+				if stack.qty>0 and stack.display_name == display_name then 
+					return k, stack.qty
+				end
+			end
+		end
+	else
+		return self.super.searchForItem(self, display_name)
+	end
+	return false
+end
+
+-- finds and places token in the token interface slot
+-- returns success
+function Craft:locateToken()
+		for k=1, self.size do
+				if self[k].display_name == settings.token then
+						self:swap(k, self.token,1)
+						return true;
+				end
+		end
+		return false;
+end
+
+-- attempts to craft the recipe in the turtle and if successful,
+-- records its ingredients and item information. (tool uses, output/craft)
+function Craft:recordRecipe(reserve)
+	local potentialRecipe = {}
+	
+	for cSlot,tSlot in pairs(self.grid) do
+		local stack = self[cSlot]
+		if stack.qty>0 then
+			potentialRecipe[tSlot] = stack.display_name
+			self:push(cSlot,tSlot,1);
+		end
+	end
+	
+	turtle.select(16)
+	if turtle.craft() then
+		local output = turtle.getItemCount(16)
+		self:pull(16,self.output,64)
+		-- record recipe
+		local itemProduced = self[self.output]
+		local itemProducedName = itemProduced.display_name
+		
+		recipes[itemProducedName] = potentialRecipe
+		recipes[itemProducedName].itemData = {}
+		if output > 1 then
+			recipes[itemProducedName].itemData.outputVolume = output
+		end
+		-- search for and record tools
+		local tools = {}
+		for k=1, 15 do
+			local foundItem = turtle.getItemCount(k)
+			if foundItem then
+				emptySlot = reserve:findEmptySlot()
+				reserve:pull(k,emptySlot)
+				local residueItem = reserve[emptySlot]
+				for slot,recipeInput in pairs(potentialRecipe) do
+					if recipeInput == residueItem.display_name then
+						-- located a tool
+						-- slot = the input item of original craft (considered a tool)
+						tools[slot] = residueItem.max_dmg>0 and residueItem.max_dmg or settings.infiniTool; -- number of uses
+						reserve:shunt(emptySlot, self)
+						break;
+					end
+				end
+			end
+		end
+		for k,v in pairs(tools) do
+			recipes[itemProducedName].tools = tools
+			break
+		end
+		local storagePath = recipeFilePath..'/'..itemProducedName
+		ccStorage.cache(recipes[itemProducedName], storagePath)
+		print('item: '..itemProducedName..' learned!\n')
+		return true
+	else
+		print('Unsuccessful craft. Not recorded!')
+		self.peripheral.condenseItems()
+		self:flushTurtleInventory()
+		return false
+	end
+end
+
+-- takes a seed item name and amount as a queue
+-- recipesList = {name='Stick', qty=5} make 5 sticks
+-- or { 'Diamon ChestPlate', 'Diamond Leggings', 'Diamond Boots', 'Diamond Helmet'}
+function Craft:ingredientRequirements(reserve, ...)
+	local components = Queue.new()
+	-- handle args
+	for _,component in ipairs(arg) do
+		if type(component) == 'string' then component = {name=component, qty=1} end
+		components:push(component);
+	end
+	--[[     virtual items 
+	Do not exist until the craft procedure is executed.
+	These items, however, are accounted for during the
+	requirement phase.
+	]]
+	local redundant = {} -- (virtual item) extra items that are the result of crafting
+	local toolTypes = {} -- [name] = maxUses
+	local toolTracker = {} -- [name] = # of uses remaining (tools built during the craft)
+	local buildOrder = {} -- [index] = name (in order)
+	local existingMat = {} -- [name] = count
+	local missingMat = {} -- [name] = count
+	
+	local depth =0;
+	
+	-- returns the outputVolume
+	local function pushComponents(recipe, qty, recipeName, predecessor)
+		
+		local output = nil;
+		local multiplier = nil;
+		
+		if toolTypes[recipeName] then 
+			output = toolTypes[recipeName]
+			multiplier = math.ceil(qty/output)
+			toolTracker[recipeName] = (output * multiplier) - qty
+			output = 1
+		else	
+			output = recipe.itemData.outputVolume or 1
+			multiplier = math.ceil(qty/output)	
+		end
+		
+		for slot=1, 11 do
+			compName = recipe[slot]
+			if compName then
+				-- prevent loops
+				if compName == predecessor then
+					return true, output
+				end
+				-- tools
+				if recipe.tools and recipe.tools[slot] then toolTypes[compName] = recipe.tools[slot]+1 end
+
+				local found=false;
+				for index,item in components('reverse') do
+					if item.name == compName then 
+						item.qty = item.qty + multiplier;
+						found=true;
+						break 
+					end
+				end
+				if not found then components:push({name=compName,qty=multiplier, predecessor = recipeName}) end
+			end
+		end
+		return false, output
+	end
+	
+	
+	while components:size() >0 do
+		-- pop component off of queue and resolve it
+		local popComp = components:pop()
+		
+		local isTool = false;
+		-- search global recipe list in memory
+		local isRecipe = recipes[popComp.name];
+		
+		
+		
+		-- found tool
+		if toolTypes[popComp.name] then
+			isTool = true
+			
+			-- check virtual tool box
+			if toolTracker[popComp.name] then
+			
+				local originalqty = popComp.qty
+				popComp.qty = popComp.qty - toolTracker[popComp.name]
+			
+				toolTracker[popComp.name] = toolTracker[popComp.name] - originalqty
+				if toolTracker[popComp.name] <= 0 then toolTracker[popComp.name] = nil; end
+			end
+		end	
+		
+		
+		if depth>0 then
+			if not missingMat[popComp.name] then
+			
+				-- check redundant list
+				if redundant[popComp.name] then
+					local originalqty = popComp.qty
+					popComp.qty = popComp.qty - redundant[popComp.name]
+				
+					redundant[popComp.name] = redundant[popComp.name] - originalqty
+					if redundant[popComp.name] <= 0 then redundant[popComp.name] = nil; end
+				end
+				
+				-- check if can be found within container (container that is calling the craft function)
+				-- physically accounted for items
+				local slotqty = 1
+				while popComp.qty >0 and slotqty do
+					-- searchForItem could be handled with getAll() -- might be faster
+					local data = {self:searchForItem(popComp.name,true)}
+					local slot = data[1]
+					slotqty = data[2]
+					
+					if slot then
+						local originalqty = popComp.qty
+						
+						if isTool then
+							local uses = self[slot].max_dmg - self[slot].dmg + 1;
+							
+							popComp.qty = popComp.qty - uses
+							
+							uses = uses > originalqty and (uses-originalqty) or 0 
+							
+							-- update toolTracker
+							if uses>0 then
+								toolTracker[popComp.name] = (toolTracker[popComp.name] or 0) + uses 
+							end
+							
+							slotqty = 1;
+						else
+							popComp.qty = popComp.qty - slotqty
+							slotqty = originalqty > slotqty and slotqty or originalqty 
+						end
+						
+						existingMat[popComp.name] = (existingMat[popComp.name] or 0) + slotqty;
+					
+						-- shunt found materials into reserve container
+						self:shunt(slot, reserve, slotqty);
+					else
+						break;
+					end
+				end
+				-- (optional) check if can be found within other crafting/storage containers
+		
+				-- (optional) check if can be processed using furnaces/macerators to acquire material
+					-- recquires a processing list
+				
+			else --(known to already be missing.)
+				-- add amount of material to missing material list
+				missingMat[popComp.name] =  missingMat[popComp.name] + popComp.qty
+				popComp.qty = 0;
+			end
+		end
+		
+		-- final attempt - try to acquire item by crafting
+		if popComp.qty >0 then
+			
+			if not isRecipe then
+				-- search through directory
+				isRecipe = findRecipe(popComp.name)
+			end
+			
+			local foundLoop = false
+			if isRecipe then
+				-- populate components queue
+				foundLoop, output = pushComponents(isRecipe, popComp.qty, popComp.name, popComp.predecessor)
+			end
+			
+			if isRecipe and not foundLoop then
+				-- add any redundant items
+				if output>1 then
+					local extraMod  = popComp.qty%isRecipe.itemData.outputVolume;
+					if  extraMod ~= 0 then
+						-- has redundant
+						redundant[popComp.name] = isRecipe.itemData.outputVolume - extraMod	
+					end
+				end
+				
+				-- add to build order (ensure unique recipe)
+				-- buildOrder = {order, name, qty}
+				local previousAmount = 0
+				for index, instruction in ipairs(buildOrder) do
+					if instruction.order == 'craft' and instruction.name == popComp.name then
+						previousAmount = instruction.qty
+						table.remove(buildOrder, index)
+						break;
+					end
+				end
+				table.insert(buildOrder, {order='craft', name = popComp.name, qty = popComp.qty + previousAmount})
+				popComp.qty=0;
+			end
+			
+			if not isRecipe then
+				-- first time found this particular missing mat
+				missingMat[popComp.name] = popComp.qty
+				popComp.qty = 0;
+			end
+			
+			if foundLoop then
+				-- first time found this particular missing mat
+				for index=#buildOrder, 1,-1 do
+					local instruction =buildOrder[index]
+					if instruction.name == popComp.predecessor then
+						missingMat[popComp.predecessor] = instruction.qty
+						table.remove(buildOrder,index)
+					end
+				end
+				
+			end
+		end
+		depth = depth + 1;
+	end
+	
+	local ceil = math.ceil
+	-- adjust missing tool usses needed
+	for name,amount in pairs(missingMat) do
+		local uses = toolTypes[name]
+		if uses then missingMat[name] = ceil(amount/uses) end 
+	end
+	-- reverse order of buildOrder
+	local m = {}
+	for k = #buildOrder, 1, -1 do
+		table.insert(m, buildOrder[k])
+	end
+	buildOrder = m;
+	
+	-- fix final buildOrder quantities
+	-- crafts
+	for index = 1, #buildOrder do
+		local instruction = buildOrder[index]
+		local craftLookUp = recipes[instruction.name]
+		if craftLookUp then
+		
+			local output = craftLookUp.itemData.outputVolume
+			
+			instruction.craftqty = (output and output>1) and ceil(instruction.qty/output) or instruction.qty;
+		
+			if craftLookUp.tools then
+				local toolNames = {}
+				for slot,uses in pairs(craftLookUp.tools) do
+					local toolName = craftLookUp[slot]
+					toolNames[toolName] = uses;
+				end
+				
+				-- make sure tool dependent crafts come after tools and tool craft quantities are adjusted
+				for indexTool = 1, #buildOrder do
+					if buildOrder[indexTool].order == 'craft' and toolNames[buildOrder[indexTool].name] then
+						local uses = toolNames[buildOrder[indexTool].name]
+						local tool = buildOrder[indexTool]
+						
+						tool.craftqty = ceil(tool.qty/uses)
+						if indexTool > index then
+							-- position tool index right before the index of craft that uses it
+							local tempTool = buildOrder[indexTool]
+							table.remove(buildOrder, indexTool)
+							table.insert(buildOrder,index,tempTool)
+						end
+					end
+				end
+			end
+		end
+	end
+	return buildOrder, existingMat, missingMat, depth, toolTypes
+end
+
+function Craft:update(reserve)
+		stack = self[self.focus]
+		outStack = self[self.output]
+		if stack.qty > 0 and outStack.qty == 0 then
+				local record = false
+				if stack.display_name == settings.token then
+						record = true;
+						-- record
+						if not self:recordRecipe(reserve) then
+							self.peripheral.condenseItems()
+							self:clearInterface()
+						else
+							self:clearInterface(self.output)
+						end
+				else
+					-- {name=stack.display_name,qty= 1}
+					-- search for recipe
+					local abort = false
+					local buildOrder, existingMat, missingMat, depth, tools = self:ingredientRequirements(reserve,stack.display_name)
+					if buildOrder then
+						
+						local function hasMissing()
+							for _,count in pairs(missingMat) do
+								if count>0 then return true end
+							end
+							return false
+						end
+						
+						while hasMissing() and not abort do
+						
+							local allMats = {}
+					
+							--'EXISTING MATS'
+							for mat,count in pairs(existingMat) do
+								allMats[mat] = count
+							end
+							
+							--'MISSING MATS'
+							for mat,count in pairs(missingMat) do
+								allMats[mat] = allMats[mat] and allMats[mat] + count or count
+							end
+							
+							sleep(1)
+							term.clear()
+							term.setCursorPos(1,1)
+							print('\n\nCHECK LIST')
+							for mat, total in pairs(allMats) do
+								local exists=0
+								if existingMat[mat] then
+									exists = existingMat[mat]
+								end
+								if exists == total then
+									term.setTextColor(colors.green)
+								elseif exists == 0 then
+									term.setTextColor(colors.red)
+								else
+									term.setTextColor(colors.yellow)
+								end
+								print(mat..' ( '..exists..'/'..total..' )')
+							end
+							
+							term.setTextColor(colors.orange)
+							
+							local validResponse = false
+							repeat
+								-- user container response
+								local focus = self[self.focus]
+								while focus.qty > 0 do
+									sleep(.2)
+									focus = self[self.focus]
+								end
+								
+								while focus.qty == 0 do
+									sleep(.2)
+									focus = self[self.focus]
+								end
+								
+								
+								-- token in focus will abort
+								if focus.display_name == settings.token then
+									term.setTextColor(colors.orange)
+									print('\n\n Aborting craft.')
+									term.setTextColor(colors.white)
+									reserve:flushInventory(craft)
+									validResponse = true
+									abort = true
+									
+								-- replacing the same item back in focus slot will search again for materials
+								elseif focus.display_name == stack.display_name then
+									print('Recalculating checklist.')
+									
+									-- identify tools
+									for material, count in pairs(missingMat) do
+										local matRecipe = recipes[material]
+										if matRecipe and matRecipe.tools then
+											for slot, uses in pairs(matRecipe.tools) do
+												tools[matRecipe[slot]] = uses
+											end
+										end
+									end
+									
+									-- main search
+									
+									for material, missingqty in pairs(missingMat) do
+										
+										local data={self:searchForItem(material,true)}
+										local slot,qty = data[1], data[2]
+										
+										while missingMat[material]>0 and slot do
+											local originalqty = missingqty;
+											
+											if tools[material] then
+												local foundTool = self[slot]
+												local uses = foundTool.max_dmg - foundTool.dmg + 1
+												
+												missingMat[material] = missingMat[material] - uses
+												uses = originalqty > uses and uses or originalqty
+												existingMat[material] = existingMat[material] and existingMat[material] + uses or uses
+												self:shunt(slot, reserve,1)
+												
+											else
+												missingMat[material] = missingMat[material] - qty
+												qty = originalqty > qty and qty or originalqty
+												existingMat[material] = existingMat[material] and existingMat[material] + qty or qty
+												self:shunt(slot, reserve,qty)
+											end
+											
+											if missingMat[material] <=0 then 
+												missingMat[material] = 0;
+											else
+												data={self:searchForItem(material,true)}
+												slot,qty = data[1], data[2]
+											end
+											
+										end
+										
+									end
+									validResponse = true
+								end
+							until validResponse
+							
+							
+							term.setTextColor(colors.white)
+						end	
+						
+						if not abort then 
+							-- craft procedure
+							if next(existingMat) then
+								for index, instruction in ipairs(buildOrder) do
+									
+									if instruction.order == 'craft' then
+										
+										local recipe = recipes[instruction.name]
+											local incompleteTool = {}
+											
+											for craftSlot, ingredient in pairs(recipe) do
+											
+												if type(craftSlot) == 'number' then
+													local amountFound = 0
+													repeat
+														local reserveSlot = reserve:searchForItem(ingredient)
+														local data = reserve[reserveSlot]
+														
+														local pushAmount = 0
+														-- tools
+														if tools[ingredient] then
+															amountFound = instruction.craftqty
+															if (data.max_dmg-data.dmg) < instruction.qty then table.insert(incompleteTool,craftSlot) end 
+															pushAmount = 1
+														else
+															
+															if data.qty >= instruction.craftqty-amountFound then
+																amountFound = instruction.craftqty
+															else
+																amountFound = amountFound + data.qty
+															end
+															
+															if (amountFound > 0 and amountFound ~= instruction.craftqty) then
+																pushAmount = instruction.craftqty-amountFound
+															else
+																pushAmount = instruction.craftqty
+															end
+														end
+														reserve:push(reserveSlot,craftSlot, pushAmount)
+													until amountFound >= instruction.craftqty
+												end
+											end
+											
+											turtle.select(16)
+											for k=1, instruction.craftqty do
+												local newIncompleteTool = {}
+												for index,craftSlot in ipairs(incompleteTool) do
+													if turtle.getItemCount(craftSlot) == 0 then
+														local reserveSlot = reserve:searchForItem(recipe[craftSlot])
+														local tool = reserve[reserveSlot]
+														reserve:push(reserveSlot, craftSlot, 1)
+														if (tool.max_dmg-dmg) < instruction.craftqty-k then table.insert(newIncompleteTool,craftSlot) end 
+													end
+												end
+												incompleteTool = newIncompleteTool
+												
+												turtle.craft()
+												local emptySlot = reserve:findEmptySlot()
+												reserve:pull(16, emptySlot)
+											end
+											-- clearing tools
+											if recipe.tools then
+												for tslot=1, 16 do
+													if turtle.getItemCount(tslot) > 0 then
+														local emptySlot = reserve:findEmptySlot()
+														reserve:pull(tslot,emptySlot) 
+													end
+												end
+											end
+											reserve:condense()
+									end
+								end
+								-- single item
+								local data = {reserve:searchForItem(buildOrder[#buildOrder].name)}
+								local reserveSlot, qty = data[1], data[2]
+								reserve:push(reserveSlot, 16)
+								self:pull(16, self.output)
+								reserve:flushInventory(self)
+							end
+						else
+							self:locateToken()
+						end
+						
+					else
+						print('Could not find recipe.')
+					end
+					-- clear focus slot
+					local slot = self:findEmptySlot()
+					self:swap(self.focus, slot)
+					-- clear global recipes list
+					recipes = {}	
+				end
+				-- reset token
+				if record then
+					self:locateToken()
+				end
+				
+		end
+end
+
+--											STORAGE CHEST
+Storage = chestProto:defineSub('storage')
+Storage:addModule(vInventory)
+Storage:addModule(Interface)
+	Storage:newInterface()
+	--Storage:newEvent('firstRowFilled', function(self,))
+	Storage:newState('deposit')
+
+
+
+
+--											RESERVE CHEST
+-- not to be tampered with by players or by other turtles
+-- an extension of the turtle's inventory. Items in this chest are considered (reserved.)
+Reserve = chestProto:defineSub('reserve')
+
+-- move all the items in the Reserve container into another container
+function Reserve:flushInventory(container)
+	self.peripheral.condenseItems()
+	for k=1, self.size do
+		local stack = self[k]
+		if stack.qty>0 then self:shunt(k,container)
+		else break; end
+	end
+end
+
+
+-- 										MAIN FUNCTIONS
+function setUpStorage()
+	if not(fs.exists('ccStorage')) then
+		shell.run("pastebin get sKKet1VY ccStorage")
+	end
+	os.loadAPI("ccStorage")
+	ccStorage.createPaths('craft','recipes')
+end
+
+-- attempts to find the saved recipe from directory
+function findRecipe(display_name)
+	local searchPath = recipeFilePath..'/'..display_name
+	if fs.exists(searchPath) then
+		recipes[display_name] = ccStorage.fetch(searchPath)
+		return recipes[display_name]
+	else
+		return false
+	end
+end
+
+
+function main()
+		if not fs.exists('StorageContents/craft/recipes') then -- first run of program 
+			setUpStorage()
+			ccStorage.cache(settings)
+		else
+			setUpStorage()
+			-- load from storage
+			settings = ccStorage.fetch(settings)
+		end
+			-- container intitialization
+		local craftSide = nil
+		
+		local data = Craft:isValidContainer()
+		
+		local counter = 0
+		while not data and counter < 4 do
+			turtle.turnRight()
+			data = Craft:isValidContainer()
+			counter = counter+1
+		end
+
+		if not data then 
+				data = Craft:isValidContainer('top')
+				
+				if data then craftSide = 'top' 
+				else print('No valid '..Craft.className..' containers found.') error() end
+		else 
+				craftSide = 'front'
+		end
+		
+		craft = Craft:new(data.rowSize, data.name)
+
+		craft:init(craftSide)
+		craft:setInterface()
+		
+		local reserveSide = 'bottom'
+		data = Reserve:isValidContainer(reserveSide)
+		if not data then print('No valid '..Reserve.className..' containers found on side: '.. reserveSide) error() end
+		reserve = Reserve:new(data.rowSize,data.name)
+		reserve:init(reserveSide)	
+		
+		craft:condense()
+		if not craft:flushTurtleInventory() then print('craft chest is too full. Please free up some space.') error() end
+		reserve:flushInventory(craft)
+		
+		
+		for k=1, #chestProto.containers.craft do
+				chestProto.containers.craft[k]:condense()
+				chestProto.containers.craft[k]:clearInterface()
+				if not chestProto.containers.craft[k]:locateToken() then print('Could not find token, '..settings.token.. '.') error() end
+		end	
+		
+		
+		local containerUpdateFunctions = {}
+			for _,containerType in pairs(chestProto.containers) do
+				for index, container in ipairs(containerType) do
+					table.insert(containerUpdateFunctions, function() while true do container:update(reserve); sleep(1.5); end end)
+				end
+			end
+		
+		-- main loop
+		parallel.waitForAll(unpack(containerUpdateFunctions))
+end
+
+	
+
+main()
+term.setBackgroundColor(colors.black)
+shell.run('clear')
